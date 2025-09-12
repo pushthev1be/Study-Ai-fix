@@ -3454,6 +3454,106 @@
 
         let currentFileIds = []; // Variable to store uploaded file IDs
 
+        // Enhanced progress tracking for content generation
+        function showProgressBar(container, title = 'Generating Study Materials') {
+            container.innerHTML = `
+                <div class="progress-container">
+                    <div class="progress-header">
+                        <div class="progress-title">🤖 ${title}</div>
+                        <div class="progress-stage" id="progress-stage-${container.id}">🔄 Initializing...</div>
+                        <div class="progress-time" id="progress-time-${container.id}">Estimated time: ~30 seconds</div>
+                    </div>
+                    
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progress-bar-${container.id}" style="width: 0%"></div>
+                    </div>
+                    
+                    <div class="progress-percentage" id="progress-percentage-${container.id}">0%</div>
+                    
+                    <div class="progress-details">
+                        <div>💡 <strong>AI is working hard to create your personalized study materials!</strong></div>
+                        <div style="margin-top: 0.5rem; font-size: 0.9rem; color: #94a3b8;">
+                            ✨ Generating summaries, flashcards, and practice questions with explanations
+                        </div>
+                    </div>
+                    
+                    <div class="progress-steps">
+                        <div class="progress-step" id="step-1-${container.id}">📤 Upload</div>
+                        <div class="progress-step" id="step-2-${container.id}">🧠 AI Processing</div>
+                        <div class="progress-step" id="step-3-${container.id}">📝 Content Creation</div>
+                        <div class="progress-step" id="step-4-${container.id}">✅ Finalizing</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function animateProgress(containerId, targetPercent, stage, stepNumber) {
+            const progressBar = document.getElementById(`progress-bar-${containerId}`);
+            const progressPercentage = document.getElementById(`progress-percentage-${containerId}`);
+            const progressStage = document.getElementById(`progress-stage-${containerId}`);
+            
+            if (!progressBar) return;
+            
+            // Update stage text
+            if (progressStage) progressStage.textContent = stage;
+            
+            // Mark current step as active, previous as completed
+            for (let i = 1; i <= 4; i++) {
+                const step = document.getElementById(`step-${i}-${containerId}`);
+                if (step) {
+                    step.classList.remove('active', 'completed');
+                    if (i < stepNumber) step.classList.add('completed');
+                    else if (i === stepNumber) step.classList.add('active');
+                }
+            }
+            
+            // Animate progress bar
+            progressBar.style.width = `${targetPercent}%`;
+            if (progressPercentage) progressPercentage.textContent = `${targetPercent}%`;
+        }
+
+        function startProgressAnimation() {
+            // Show progress bars in all content areas
+            const summaryContent = document.getElementById('summaryContent');
+            const flashcardsContent = document.getElementById('flashcardsContent');
+            const practiceContent = document.getElementById('practiceContent');
+            
+            showProgressBar(summaryContent, 'Creating AI Summary');
+            showProgressBar(flashcardsContent, 'Generating Flashcards');
+            showProgressBar(practiceContent, 'Building Practice Questions');
+
+            // Start progress animation
+            let progress = 0;
+            const progressInterval = setInterval(() => {
+                progress += 1;
+                
+                if (progress <= 15) {
+                    animateProgress('summaryContent', progress, '📤 Uploading files...', 1);
+                    animateProgress('flashcardsContent', progress, '📤 Uploading files...', 1);
+                    animateProgress('practiceContent', progress, '📤 Uploading files...', 1);
+                } else if (progress <= 45) {
+                    animateProgress('summaryContent', progress, '🧠 AI analyzing content...', 2);
+                    animateProgress('flashcardsContent', progress, '🧠 AI analyzing content...', 2);
+                    animateProgress('practiceContent', progress, '🧠 AI analyzing content...', 2);
+                } else if (progress <= 85) {
+                    animateProgress('summaryContent', progress, '📝 Creating study materials...', 3);
+                    animateProgress('flashcardsContent', progress, '📝 Creating study materials...', 3);
+                    animateProgress('practiceContent', progress, '📝 Creating study materials...', 3);
+                } else if (progress <= 95) {
+                    animateProgress('summaryContent', progress, '✅ Finalizing content...', 4);
+                    animateProgress('flashcardsContent', progress, '✅ Finalizing content...', 4);
+                    animateProgress('practiceContent', progress, '✅ Finalizing content...', 4);
+                }
+                
+                if (progress >= 95) {
+                    clearInterval(progressInterval);
+                }
+            }, 300); // Update every 300ms for smooth animation
+            
+            // Store interval globally so it can be cleared when content loads
+            window.progressInterval = progressInterval;
+        }
+
         async function processFiles() {
             if (uploadedFiles.length === 0 || !isLoggedIn) {
                 showToast('Please login and upload files first', 'error');
@@ -3463,6 +3563,9 @@
             const processBtn = document.getElementById('processBtn');
             processBtn.textContent = '⏳ Processing...';
             processBtn.disabled = true;
+
+            // Start the enhanced progress animation
+            startProgressAnimation();
 
             try {
                 // Upload files
@@ -3483,6 +3586,12 @@
                 if (!generateResult.success) {
                     const errorMsg = generateResult.error || 'Content generation failed';
                     throw new Error(errorMsg);
+                }
+
+                // Clear progress animation when content loads
+                if (window.progressInterval) {
+                    clearInterval(window.progressInterval);
+                    window.progressInterval = null;
                 }
 
                 currentSession = generateResult.data.sessionId;
@@ -3506,6 +3615,12 @@
                 }
                 showToast(errorMessage, 'error');
             } finally {
+                // Clear progress animation on error/completion
+                if (window.progressInterval) {
+                    clearInterval(window.progressInterval);
+                    window.progressInterval = null;
+                }
+                
                 processBtn.textContent = '🚀 Generate Study Materials';
                 processBtn.disabled = false;
             }
