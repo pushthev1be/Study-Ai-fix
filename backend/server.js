@@ -1,21 +1,106 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const path = require('path');
 const fs = require('fs').promises;
+const path = require('path');
 const crypto = require('crypto');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { MongoClient, ObjectId } = require('mongodb');
+const backendTesting = require('./testing-middleware');
 require('dotenv').config();
 
 const OpenAI = require('openai');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 
-const { MongoClient, ObjectId } = require('mongodb');
 const { startMongoDB } = require('./start-mongodb');
 
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcrypt');
+// Token tracking and cost optimization for OpenAI API
+const tokenUsage = {
+    totalTokens: 0,
+    totalCost: 0,
+    sessions: new Map() // Track per-session usage
+};
+
+// GPT-4o-mini pricing (per 1M tokens) - 50% less for cached tokens
+const PRICING = {
+    'gpt-4o-mini': {
+        input: 0.15,  // $0.15 per 1M input tokens
+        output: 0.60, // $0.60 per 1M output tokens
+        cached_input: 0.075 // 50% discount for cached prompt tokens (>1024 tokens automatically cached by OpenAI)
+    }
+};
+
+// Helper to calculate token cost with proper cached token support
+function calculateCost(model, usage) {
+    const pricing = PRICING[model] || PRICING['gpt-4o-mini'];
+    
+    // Check for cached tokens in the response from OpenAI
+    const cachedTokens = usage.prompt_tokens_details?.cached_tokens || 0;
+    const regularInputTokens = usage.prompt_tokens - cachedTokens;
+    
+    // Calculate costs: cached tokens get 50% discount
+    const cachedCost = (cachedTokens / 1000000) * pricing.cached_input;
+    const inputCost = (regularInputTokens / 1000000) * pricing.input;
+    const outputCost = (usage.completion_tokens / 1000000) * pricing.output;
+    
+    return cachedCost + inputCost + outputCost;
+}
+
+// Helper to track token usage with accurate cost calculation
+function trackTokenUsage(sessionId, model, usage) {
+    if (!usage) return;
+    
+    const cost = calculateCost(model, usage);
+    const cachedTokens = usage.prompt_tokens_details?.cached_tokens || 0;
+    
+    tokenUsage.totalTokens += usage.total_tokens;
+    tokenUsage.totalCost += cost;
+    
+    if (sessionId) {
+        const session = tokenUsage.sessions.get(sessionId) || { tokens: 0, cost: 0, cachedTokens: 0 };
+        session.tokens += usage.total_tokens;
+        session.cost += cost;
+        session.cachedTokens += cachedTokens;
+        tokenUsage.sessions.set(sessionId, session);
+    }
+    
+    const cacheInfo = cachedTokens > 0 ? ` (${cachedTokens} cached)` : '';
+    console.log(`💰 Token usage: ${usage.total_tokens} tokens${cacheInfo}, $${cost.toFixed(4)} cost`);
+    return { tokens: usage.total_tokens, cost, cachedTokens };
+}
+
+// Token estimation helper (approximately 1 token = 4 characters)
+function estimateTokens(text) {
+    return Math.ceil(text.length / 4);
+}
+
+// Truncate text to approximately maxTokens
+function truncateToTokenLimit(text, maxTokens = 2000) {
+    const estimatedTokens = estimateTokens(text);
+    if (estimatedTokens <= maxTokens) {
+        return text;
+    }
+    
+    // Truncate to approximately maxTokens (using 4 chars per token estimate)
+    const maxChars = maxTokens * 4;
+    return text.substring(0, maxChars) + '\n[Content truncated for token optimization]';
+}
+
+// Schema max tokens configuration
+const SCHEMA_MAX_TOKENS = {
+    'questions': 3000,
+    'flashcards': 1500,
+    'batch_flashcards': 2000,
+    'simple_flashcards': 1200,
+    'batch_questions': 4000,
+    'template_questions': 3500,
+    'summary': 800,
+    'knowledgeGaps': 600,
+    'studyPlan': 1000,
+    'default': 1500
+};
 
 // Add Ajv for JSON schema validation
 const Ajv = require('ajv');
@@ -25,6 +110,7 @@ const ajv = new Ajv();
 const questionSetSchema = {
     type: "object",
     required: ["title", "difficulty", "description", "multipleChoice", "shortAnswer", "essay"],
+    additionalProperties: false,
     properties: {
         title: { type: "string" },
         difficulty: { type: "string", enum: ["Easy", "Medium", "Hard"] },
@@ -34,9 +120,10 @@ const questionSetSchema = {
             items: {
                 type: "object",
                 required: ["question", "options", "correctAnswer", "explanation", "difficulty", "topic"],
+                additionalProperties: false,
                 properties: {
                     question: { type: "string" },
-                    options: { type: "array", items: { type: "string" }, minItems: 4, maxItems: 4 },
+                    options: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 4 },
                     correctAnswer: { type: "string" },
                     explanation: { type: "string" },
                     difficulty: { type: "number", minimum: 1, maximum: 5 },
@@ -53,6 +140,7 @@ const questionSetSchema = {
             items: {
                 type: "object",
                 required: ["question", "sampleAnswer", "points"],
+                additionalProperties: false,
                 properties: {
                     question: { type: "string" },
                     sampleAnswer: { type: "string" },
@@ -67,6 +155,7 @@ const questionSetSchema = {
             items: {
                 type: "object",
                 required: ["question", "guidelines", "points"],
+                additionalProperties: false,
                 properties: {
                     question: { type: "string" },
                     guidelines: { type: "string" },
@@ -82,20 +171,22 @@ const questionSetSchema = {
 const flashcardBatchSchema = {
     type: "object",
     required: ["flashcards"],
+    additionalProperties: false,
     properties: {
         flashcards: {
             type: "array",
             items: {
                 type: "object",
                 required: ["term", "definition", "visualDescription", "mnemonic", "multipleExamples", "commonMisconceptions", "connections", "practiceQuestion", "memoryTips", "category", "difficulty", "importance"],
+                additionalProperties: false,
                 properties: {
                     term: { type: "string" },
                     definition: { type: "string" },
                     visualDescription: { type: "string" },
                     mnemonic: { type: "string" },
-                    multipleExamples: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
-                    commonMisconceptions: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
-                    connections: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 3 },
+                    multipleExamples: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 5 },
+                    commonMisconceptions: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 5 },
+                    connections: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 5 },
                     practiceQuestion: { type: "string" },
                     memoryTips: { type: "string" },
                     category: { type: "string" },
@@ -103,8 +194,97 @@ const flashcardBatchSchema = {
                     importance: { type: "number", minimum: 1, maximum: 5 }
                 }
             },
-            minItems: 5,
-            maxItems: 5
+            minItems: 3,
+            maxItems: 7
+        }
+    }
+};
+
+// Optimized simple flashcard schema for flip cards
+const simpleFlashcardSchema = {
+    type: "object",
+    required: ["flashcards"],
+    additionalProperties: false,
+    properties: {
+        flashcards: {
+            type: "array",
+            items: {
+                type: "object",
+                required: ["front", "back"],
+                additionalProperties: false,
+                properties: {
+                    front: { type: "string" }, // Critical knowledge/term
+                    back: { type: "string" }  // Concise explanation
+                }
+            },
+            minItems: 10,
+            maxItems: 10
+        }
+    }
+};
+
+// Batch question schema for 20 questions at once
+const batchQuestionSchema = {
+    type: "object",
+    required: ["questions"],
+    additionalProperties: false,
+    properties: {
+        questions: {
+            type: "array",
+            items: {
+                type: "object",
+                required: ["question", "options", "correctAnswer", "explanation"],
+                additionalProperties: false,
+                properties: {
+                    question: { type: "string" },
+                    options: { type: "array", items: { type: "string" }, minItems: 4, maxItems: 4 },
+                    correctAnswer: { type: "string" },
+                    explanation: { type: "string" }
+                }
+            },
+            minItems: 20,
+            maxItems: 20
+        }
+    }
+};
+
+// Template question schema for new 7+4 format
+const templateQuestionSchema = {
+    type: "object",
+    required: ["questions"],
+    additionalProperties: false,
+    properties: {
+        questions: {
+            type: "array",
+            items: {
+                type: "object",
+                required: ["question", "options", "correctAnswer", "explanation", "difficulty", "topic", "type", "learningObjective", "hints", "commonMistakes", "timeEstimate"],
+                additionalProperties: false,
+                properties: {
+                    question: { type: "string" },
+                    options: {
+                        type: "array",
+                        items: { type: "string" },
+                        minItems: 3,
+                        maxItems: 4
+                    },
+                    correctAnswer: { type: "string" },
+                    explanation: { type: "string" },
+                    difficulty: { type: "number", minimum: 1, maximum: 5 },
+                    topic: { type: "string" },
+                    type: { type: "string", enum: ["direct", "twisted"] },
+                    learningObjective: { type: "string" },
+                    hints: {
+                        type: "array",
+                        items: { type: "string" }
+                    },
+                    commonMistakes: {
+                        type: "array", 
+                        items: { type: "string" }
+                    },
+                    timeEstimate: { type: "string" }
+                }
+            }
         }
     }
 };
@@ -112,6 +292,9 @@ const flashcardBatchSchema = {
 // Compile schemas for faster validation
 const validateQuestionSet = ajv.compile(questionSetSchema);
 const validateFlashcardBatch = ajv.compile(flashcardBatchSchema);
+const validateTemplateQuestions = ajv.compile(templateQuestionSchema);
+const validateBatchQuestions = ajv.compile(batchQuestionSchema);
+const validateSimpleFlashcards = ajv.compile(simpleFlashcardSchema);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -121,15 +304,53 @@ const openai = new OpenAI({
 });
 
 let db;
-const mongoClient = new MongoClient(process.env.MONGODB_URI || 'mongodb://localhost:27017/studymaster');
+let mongoClient;
+
+// In-memory cache for active question sessions
+const questionSessionCache = new Map();
+
+const getMongoClient = (uri) => new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
+
+function isLocalUri(uri) { 
+    return !!uri && /^mongodb:\/\/(localhost|127\.0\.0\.1)(:|\/)/.test(uri); 
+}
 
 async function initializeDatabase() {
     if (!db) {
         if (app.locals && app.locals.testDb) {
             db = app.locals.testDb;
         } else {
-            await mongoClient.connect();
+            let uri = process.env.MONGODB_URI;
+            const forceMemory = process.env.MONGODB_USE_MEMORY === '1';
+            
+            // Force Memory Server if no URI, localhost URI, or forced
+            if (forceMemory || !uri || isLocalUri(uri)) {
+                console.log('🔄 Using in-memory MongoDB (no/localhost URI detected)');
+                const { startMongoDB } = require('./start-mongodb');
+                uri = await startMongoDB();
+                process.env.MONGODB_URI = uri; // override stale value
+            }
+            
+            try {
+                console.log('🔗 Attempting to connect to MongoDB:', isLocalUri(uri) ? '(local)' : '(external)');
+                mongoClient = getMongoClient(uri);
+                await mongoClient.connect();
+            } catch (err) {
+                console.warn('⚠️ Connect failed, falling back to in-memory MongoDB...', err.message);
+                const { startMongoDB } = require('./start-mongodb');
+                uri = await startMongoDB();
+                process.env.MONGODB_URI = uri;
+                mongoClient = getMongoClient(uri);
+                await mongoClient.connect();
+            }
+            
+            // Test the connection with a ping
             db = mongoClient.db('studymaster');
+            await db.command({ ping: 1 });
+            console.log('🏓 Database ping successful');
+            
+            app.locals.mongoClient = mongoClient;
+            console.log('✅ Connected to MongoDB successfully');
         }
 
         // Create indexes
@@ -137,6 +358,14 @@ async function initializeDatabase() {
         await db.collection('files').createIndex({ embedding: 1 });
         await db.collection('flashcards').createIndex({ userId: 1, nextReview: 1 });
         await db.collection('users').createIndex({ email: 1 }, { unique: true });
+        
+        // New indexes for question batching system
+        await db.collection('study_sessions').createIndex({ userId: 1, topicKey: 1 });
+        await db.collection('study_sessions').createIndex({ createdAt: -1 });
+        await db.collection('question_batches').createIndex({ sessionId: 1, batchNumber: 1 });
+        await db.collection('question_batches').createIndex({ sessionId: 1, 'questions.status': 1 });
+        
+        console.log('✅ Database indexes created');
     }
     return db;
 }
@@ -172,8 +401,46 @@ app.use(cors({
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Testing Middleware
+app.use(backendTesting.requestLogger());
+
+// Middleware
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Enhanced CORS configuration
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+
+        // Allow all Replit domains and local development
+        const allowedOrigins = [
+            'http://localhost:8080',
+            'http://127.0.0.1:8080',
+            'http://localhost:5000',
+            'http://127.0.0.1:5000',
+            'https://study-ai-2.onrender.com'
+        ];
+
+        // Allow any replit.dev or repl.co domain
+        if (origin && (origin.includes('.replit.dev') || origin.includes('.repl.co') || origin.includes('janeway'))) {
+            return callback(null, true);
+        }
+
+        // Allow configured origins
+        if (allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+
+        // Allow all origins for development (can be restricted in production)
+        callback(null, true);
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+};
 
 // Handle proxied requests from frontend
 app.use((req, res, next) => {
@@ -322,8 +589,17 @@ function generateSimpleEmbedding(text) {
     return embedding;
 }
 
-// Helper function for retry logic with exponential backoff
-async function retryWithBackoff(operation, maxRetries = 2, baseDelay = 1000) {
+// Request coalescing cache to prevent duplicate processing
+const inflightRequests = new Map();
+const contentCache = new Map();
+
+// Generate cache key for request deduplication
+function generateRequestKey(userId, fileIds, mode, textLength) {
+    return `${userId}:${JSON.stringify(fileIds.sort())}:${mode}:${textLength}`;
+}
+
+// Optimized retry logic with jitter and better error handling
+async function retryWithBackoff(operation, maxRetries = 1, baseDelay = 150) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
             return await operation();
@@ -331,33 +607,64 @@ async function retryWithBackoff(operation, maxRetries = 2, baseDelay = 1000) {
             if (attempt === maxRetries) {
                 throw error;
             }
+            
+            // Don't retry on 4xx errors except 408, 429
+            const status = error.response?.status || error.status;
+            if (status >= 400 && status < 500 && ![408, 429].includes(status)) {
+                throw error;
+            }
 
-            const delay = baseDelay * Math.pow(2, attempt);
-            console.log(`❌ Attempt ${attempt + 1} failed, retrying in ${delay}ms...`);
+            // Add jitter to prevent thundering herd
+            const jitter = Math.random() * 0.3 + 0.85; // 85-115% of base delay
+            const delay = Math.min(baseDelay * Math.pow(1.5, attempt) * jitter, 2000);
+            console.log(`❌ Attempt ${attempt + 1} failed, retrying in ${Math.round(delay)}ms...`);
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
 }
 
-// Core API call function with validation
-async function makeValidatedAPICall(prompt, schema, validator, type, batchName = '') {
+// Core API call function with validation using structured JSON schema
+async function makeValidatedAPICall(prompt, schema, validator, type, batchName = '', sessionId = null) {
     const operation = async () => {
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-                {
-                    role: "system",
-                    content: "You are an expert educator. Always respond with valid JSON only. No markdown, no code blocks, just pure JSON. Ensure all JSON strings are properly escaped and terminated."
-                },
-                {
-                    role: "user",
-                    content: prompt
+        const startTime = Date.now();
+        
+        // Token-aware prompt truncation (target ~2000 tokens for prompt)
+        const optimizedPrompt = truncateToTokenLimit(prompt, 2000);
+        
+        // Get max tokens for this schema type
+        const maxTokens = SCHEMA_MAX_TOKENS[type] || SCHEMA_MAX_TOKENS.default;
+        
+        const response = await Promise.race([
+            openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                    {
+                        role: "system",
+                        content: "You are an expert educator. Generate content strictly according to the provided JSON schema. Be concise and efficient."
+                    },
+                    {
+                        role: "user",
+                        content: optimizedPrompt
+                    }
+                ],
+                temperature: 0.3, // Optimized for balance of speed and quality
+                max_tokens: maxTokens, // Dynamic based on content type
+                response_format: { 
+                    type: "json_schema", 
+                    json_schema: { 
+                        name: "response", 
+                        schema: schema,
+                        strict: true 
+                    } 
                 }
-            ],
-            temperature: 0.4, // Lower temperature for more consistent output
-            max_tokens: 1400, // Appropriate for batched content
-            response_format: { type: "json_object" }
-        });
+            }),
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error(`OpenAI request timeout after 50 seconds for ${type}${batchName ? ' ' + batchName : ''}`)), 50000)
+            )
+        ]);
+
+        const endTime = Date.now();
+        console.log(`⚡ OpenAI API call for ${type}${batchName ? ' ' + batchName : ''} completed in ${endTime - startTime}ms`);
 
         const rawContent = response.choices[0].message.content;
 
@@ -365,305 +672,322 @@ async function makeValidatedAPICall(prompt, schema, validator, type, batchName =
             throw new Error(`Empty response from OpenAI for ${type}${batchName ? ' ' + batchName : ''}`);
         }
 
-        // Clean JSON response
-        let cleanedContent = rawContent.replace(/```json\n?/gi, '').replace(/```\n?/g, '').trim();
-
+        // Parse JSON with better error handling
         let parsed;
         try {
-            parsed = JSON.parse(cleanedContent);
+            parsed = JSON.parse(rawContent);
         } catch (parseError) {
-            // Try cleaning common JSON issues
-            cleanedContent = cleanedContent.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
-            parsed = JSON.parse(cleanedContent);
+            console.error(`❌ JSON parsing failed for ${type}${batchName ? ' ' + batchName : ''}:`, parseError.message);
+            console.error('Raw content:', rawContent.substring(0, 500) + '...');
+            throw new Error(`JSON parsing failed: ${parseError.message}`);
         }
 
-        // Validate against schema
+        // Validate against schema (should always pass with strict: true)
         if (!validator(parsed)) {
             console.error(`❌ Schema validation failed for ${type}${batchName ? ' ' + batchName : ''}:`, validator.errors);
             throw new Error(`Schema validation failed: ${validator.errors.map(e => e.message).join(', ')}`);
         }
 
-        console.log(`✅ Successfully generated and validated ${type}${batchName ? ' ' + batchName : ''}`);
+        // Track token usage with proper session tracking
+        if (response.usage) {
+            trackTokenUsage(sessionId, 'gpt-4o-mini', response.usage);
+        }
+        
+        console.log(`✅ Successfully generated and validated ${type}${batchName ? ' ' + batchName : ''} in ${endTime - startTime}ms`);
         return parsed;
     };
 
-    return await retryWithBackoff(operation, 2, 1000);
+    return await retryWithBackoff(operation, 2, 200); // Increased retries and delay for better reliability
 }
 
-// Generate questions in 3 sequential batches
-async function generateQuestionsBatched(text) {
-    console.log('🔄 Starting batched questions generation...');
+// Generate batch of 20 questions at once for Keep Going feature
+async function generateQuestionBatch(text, sessionContext = null) {
+    console.log('🎯 Generating batch of 20 questions...');
+    
+    // Use context summary if available, otherwise create concise summary
+    const contextText = sessionContext?.contextSummary || text.substring(0, 1500);
+    const previousTopics = sessionContext?.previousTopics || [];
+    
+    const prompt = `Generate exactly 20 multiple choice questions. Keep it simple and fast.
 
-    const sets = {};
-    const setConfigs = [
-        {
-            key: 'set1',
-            title: 'Fundamentals',
-            difficulty: 'Easy',
-            description: 'Basic concepts and definitions',
-            focus: 'fundamental concepts and key definitions'
-        },
-        {
-            key: 'set2',
-            title: 'Application',
-            difficulty: 'Medium',
-            description: 'Applying concepts and problem solving',
-            focus: 'practical applications and problem-solving scenarios'
-        },
-        {
-            key: 'set3',
-            title: 'Analysis',
-            difficulty: 'Hard',
-            description: 'Critical thinking and advanced analysis',
-            focus: 'complex analysis and critical thinking'
+Content: ${contextText}
+
+${previousTopics.length > 0 ? `Avoid these topics already covered: ${previousTopics.join(', ')}` : ''}
+
+Generate diverse questions covering different aspects.`;
+
+    const operation = async () => {
+        const response = await openai.chat.completions.create({
+            model: "gpt-4o-mini", // Fast model
+            messages: [
+                {
+                    role: "system",
+                    content: "Generate exactly 20 multiple choice questions. Each with 4 options and clear explanation."
+                },
+                { role: "user", content: prompt }
+            ],
+            temperature: 0.3, // Lower for speed
+            max_tokens: 4000,
+            response_format: { 
+                type: "json_schema",
+                json_schema: {
+                    name: "question_batch",
+                    strict: true,
+                    schema: batchQuestionSchema
+                }
+            }
+        });
+
+        const content = JSON.parse(response.choices[0].message.content);
+        
+        // Track token usage for batch generation
+        if (response.usage) {
+            trackTokenUsage(sessionContext?.sessionId, 'gpt-4o-mini', response.usage);
         }
-    ];
+        
+        return content.questions;
+    };
 
-    for (const config of setConfigs) {
-        const prompt = `Generate practice questions focusing on ${config.focus} for this content.
+    return await retryWithBackoff(operation, 2, 200);
+}
 
-Content: ${text.substring(0, 6000)}
+// Generate template-based questions: 7 direct + 4 twisted 
+async function generateQuestionsBatched(text, sessionId = null) {
+    console.log('🔄 Starting optimized template-based questions generation (7 direct + 4 twisted)...');
 
-Create a question set with the following structure:
-- ${config.difficulty} difficulty level
-- 3-4 multiple choice questions
-- 2 short answer questions
-- 1 essay question
+    // Use token-aware truncation for optimal processing
+    const optimizedText = truncateToTokenLimit(text, 750); // ~750 tokens for faster processing
 
-Return ONLY valid JSON in this exact format:
+    // Optimized concise prompt for direct questions
+    const directPrompt = `Generate 7 questions from key concepts in this content:
+
+${optimizedText}
+
+Return JSON:
 {
-    "title": "${config.title}",
-    "difficulty": "${config.difficulty}",
-    "description": "${config.description}",
-    "multipleChoice": [
+    "questions": [
         {
-            "question": "Clear, specific question",
-            "options": ["Option A", "Option B", "Option C", "Option D"],
-            "correctAnswer": "Option A",
-            "explanation": "Detailed explanation",
-            "difficulty": 3,
-            "topic": "Specific topic area",
-            "learningObjective": "What this tests",
-            "hints": ["Helpful hint"],
-            "commonMistakes": ["Common mistake"],
+            "question": "Question text",
+            "options": ["A", "B", "C", "D"],
+            "correctAnswer": "A",
+            "explanation": "Brief explanation",
+            "difficulty": 2,
+            "topic": "Topic",
+            "type": "direct",
+            "learningObjective": "Learning goal",
+            "hints": ["Hint"],
+            "commonMistakes": ["Mistake"],
             "timeEstimate": "2 minutes"
-        }
-    ],
-    "shortAnswer": [
-        {
-            "question": "Open-ended question",
-            "sampleAnswer": "Sample response",
-            "points": 5,
-            "rubric": "Grading criteria",
-            "keyPoints": ["Key point 1", "Key point 2"]
-        }
-    ],
-    "essay": [
-        {
-            "question": "Complex analytical question",
-            "guidelines": "Writing guidelines",
-            "points": 20,
-            "structure": "Essay structure",
-            "resources": ["Resource 1"]
         }
     ]
 }`;
 
-        try {
-            const result = await makeValidatedAPICall(prompt, questionSetSchema, validateQuestionSet, 'questions', config.key);
-            sets[config.key] = result;
-            console.log(`✅ Generated ${config.key}: ${result.multipleChoice.length} MC, ${result.shortAnswer.length} SA, ${result.essay.length} essay`);
-        } catch (error) {
-            console.error(`❌ Failed to generate ${config.key}:`, error.message);
-            throw new Error(`Failed to generate question ${config.key}: ${error.message}`);
-        }
-    }
+    // Optimized concise prompt for application questions
+    const twistedPrompt = `Generate 4 application questions using concepts from this content in new scenarios:
 
-    console.log('✅ Questions generation completed successfully');
-    return sets;
+${optimizedText}
+
+Return JSON:
+{
+    "questions": [
+        {
+            "question": "Application question",
+            "options": ["A", "B", "C", "D"],
+            "correctAnswer": "A",
+            "explanation": "Brief connection to content",
+            "difficulty": 3,
+            "topic": "Application",
+            "type": "twisted",
+            "learningObjective": "Apply to new situation",
+            "hints": ["Hint"],
+            "commonMistakes": ["Mistake"],
+            "timeEstimate": "3 minutes"
+        }
+    ]
+}`;
+
+    try {
+        // Generate direct and twisted questions in parallel with optimized timeout
+        console.log('🔄 Generating 7 direct + 4 twisted questions in parallel (optimized)...');
+        const startTime = Date.now();
+        
+        const [directResult, twistedResult] = await Promise.all([
+            makeValidatedAPICall(directPrompt, templateQuestionSchema, validateTemplateQuestions, 'template_questions', 'direct', sessionId),
+            makeValidatedAPICall(twistedPrompt, templateQuestionSchema, validateTemplateQuestions, 'template_questions', 'twisted', sessionId)
+        ]);
+
+        const endTime = Date.now();
+        console.log(`⚡ Parallel generation completed in ${endTime - startTime}ms`);
+
+        // Combine into single set with template structure
+        const templateQuestions = {
+            title: "Template Practice Questions",
+            description: "7 content-focused + 4 creative application questions",
+            totalQuestions: 11,
+            contentQuestions: directResult.questions || [],
+            twistedQuestions: twistedResult.questions || [],
+            allQuestions: [...(directResult.questions || []), ...(twistedResult.questions || [])]
+        };
+
+        console.log(`✅ Generated template questions in parallel: ${templateQuestions.contentQuestions.length} direct + ${templateQuestions.twistedQuestions.length} twisted = ${templateQuestions.allQuestions.length} total`);
+        return templateQuestions;
+
+    } catch (error) {
+        console.error('❌ Failed to generate template questions:', error.message);
+        throw new Error(`Failed to generate template questions: ${error.message}`);
+    }
 }
 
-// Generate flashcards in 4 batches of 5 cards each
-async function generateFlashcardsBatched(text) {
-    console.log('🔄 Starting batched flashcards generation...');
+// Generate exactly 5 crucial flashcards (template approach)
+async function generateFlashcardsBatched(text, sessionId = null) {
+    console.log('🔄 Starting crucial flashcards generation (template: 5 cards)...');
 
-    const allFlashcards = [];
-    const usedTerms = new Set();
+    const prompt = `Analyze this content and identify the 5 MOST CRUCIAL concepts that students must master. Create exactly 5 premium flashcards for these essential concepts.
 
-    const topics = [
-        'fundamental concepts and basic principles',
-        'key processes and mechanisms',
-        'important relationships and connections',
-        'practical applications and examples'
-    ];
+Content: ${truncateToTokenLimit(text, 1500)}
 
-    for (let batchNum = 0; batchNum < 4; batchNum++) {
-        const topic = topics[batchNum];
-        const usedTermsList = Array.from(usedTerms).join(', ');
-
-        const prompt = `Create exactly 5 educational flashcards focusing on ${topic} from this content.
-
-Content: ${text.substring(0, 6000)}
-
-${usedTerms.size > 0 ? `IMPORTANT: Do not repeat these already used terms: ${usedTermsList}` : ''}
+Selection criteria for crucial concepts:
+- Fundamental principles that everything else builds upon
+- Key definitions students must know by heart  
+- Core processes or mechanisms central to the topic
+- Essential knowledge for understanding advanced concepts
+- Most commonly tested or referenced material
 
 Each flashcard must have ALL these elements:
-- term: Unique concept name (not already used)
-- definition: Clear explanation with context
-- visualDescription: Mental imagery for memory
-- mnemonic: Memory device or acronym
-- multipleExamples: Array of exactly 3 real-world examples
-- commonMisconceptions: Array of exactly 3 common mistakes
-- connections: Array of exactly 3 related concepts
-- practiceQuestion: Self-test question
-- memoryTips: Study strategies
-- category: Subject area
-- difficulty: 1-5 scale
-- importance: 1-5 scale
+- term: The most crucial concept name
+- definition: Clear, comprehensive explanation with context
+- visualDescription: Vivid mental imagery for memory retention
+- mnemonic: Creative memory device or acronym
+- multipleExamples: Array of exactly 3 concrete, relatable examples
+- commonMisconceptions: Array of exactly 3 frequent student mistakes
+- connections: Array of exactly 3 related concepts within the material
+- practiceQuestion: Self-assessment question with clear answer
+- memoryTips: Specific study strategies for this concept
+- category: Subject area classification
+- difficulty: 1-5 scale (1=basic, 5=advanced)
+- importance: 5 (all should be maximum importance)
 
 Return ONLY this JSON structure:
 {
     "flashcards": [
         {
-            "term": "Unique Concept Name",
-            "definition": "Clear definition with context",
-            "visualDescription": "Mental imagery description",
-            "mnemonic": "Memory device",
-            "multipleExamples": ["Example 1", "Example 2", "Example 3"],
-            "commonMisconceptions": ["Mistake 1", "Mistake 2", "Mistake 3"],
-            "connections": ["Related concept 1", "Related concept 2", "Related concept 3"],
-            "practiceQuestion": "Test question",
-            "memoryTips": "Study strategies",
-            "category": "Subject",
+            "term": "Crucial Concept Name",
+            "definition": "Comprehensive definition with full context",
+            "visualDescription": "Rich mental imagery description", 
+            "mnemonic": "Memorable device or acronym",
+            "multipleExamples": ["Concrete example 1", "Relatable example 2", "Real-world example 3"],
+            "commonMisconceptions": ["Frequent mistake 1", "Common confusion 2", "Typical error 3"],
+            "connections": ["Related concept 1", "Connected idea 2", "Linked principle 3"],
+            "practiceQuestion": "Self-test question about this concept",
+            "memoryTips": "Specific study strategy for mastering this",
+            "category": "Subject Area",
             "difficulty": 3,
-            "importance": 4
+            "importance": 5
         }
     ]
 }`;
 
-        try {
-            const result = await makeValidatedAPICall(prompt, flashcardBatchSchema, validateFlashcardBatch, 'flashcards', `batch${batchNum + 1}`);
+    try {
+        const result = await makeValidatedAPICall(prompt, flashcardBatchSchema, validateFlashcardBatch, 'batch_flashcards', 'crucial', sessionId);
 
-            // Check for duplicate terms and add to used terms set
-            for (const card of result.flashcards) {
-                const term = card.term.toLowerCase().trim();
-                if (usedTerms.has(term)) {
-                    console.warn(`⚠️ Duplicate term detected in batch ${batchNum + 1}: ${card.term}`);
-                    // Modify term to make it unique
-                    card.term = `${card.term} (${topic.split(' ')[0]})`;
-                }
-                usedTerms.add(term);
-                allFlashcards.push(card);
-            }
+        console.log(`✅ Generated ${result.flashcards.length} crucial flashcards`);
+        return { flashcards: result.flashcards };
 
-            console.log(`✅ Generated batch ${batchNum + 1}: ${result.flashcards.length} flashcards`);
-        } catch (error) {
-            console.error(`❌ Failed to generate flashcards batch ${batchNum + 1}:`, error.message);
-            throw new Error(`Failed to generate flashcard batch ${batchNum + 1}: ${error.message}`);
-        }
+    } catch (error) {
+        console.error('❌ Failed to generate crucial flashcards:', error.message);
+        throw new Error(`Failed to generate crucial flashcards: ${error.message}`);
     }
-
-    console.log(`✅ Flashcards generation completed: ${allFlashcards.length} total cards`);
-    return { flashcards: allFlashcards };
 }
 
 // Main function that routes to batched or regular generation
+// Cache cleanup - remove expired entries every 10 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, value] of contentCache.entries()) {
+        if (now - value.timestamp > 300000) { // 5 minute TTL
+            contentCache.delete(key);
+        }
+    }
+}, 600000);
+
 async function generateStudyContent(text, type, options = {}) {
+    const sessionId = options.sessionId || null;
+    
     if (type === 'questions') {
-        return await generateQuestionsBatched(text);
+        return await generateQuestionsBatched(text, sessionId);
     } else if (type === 'flashcards') {
-        // Original logic for generating flashcards in batches has been replaced by the initial 6 cards generation.
-        // This function will now only generate the initial 6 cards.
-        // The logic for generating more flashcards is handled by a separate endpoint.
-        const INITIAL_BATCH_SIZE = 5;
-        console.log(`🔄 Generating initial ${INITIAL_BATCH_SIZE} flashcards...`);
+        // Generate 10 simple flashcards
+        console.log('🔄 Generating 10 simple flashcards...');
+        
+        const prompt = `Create exactly 10 simple flashcards. Each with:
+- Front: Critical term or concept (5-10 words)
+- Back: Clear explanation (20-40 words)
 
-        // Split text into chunks to potentially pick a relevant topic
-        const contentChunks = text.split('\n\n').filter(chunk => chunk.trim().length > 50);
-        if (contentChunks.length === 0) {
-            throw new Error('No substantial content found to generate flashcards.');
-        }
+Content: ${text.substring(0, 2000)}
 
-        const topic = contentChunks[0]; // Use first chunk for initial cards
+Focus on the most important concepts only.`;
 
-        const prompt = `Create EXACTLY ${INITIAL_BATCH_SIZE} premium flashcards with enhanced features like Quizlet Plus from this content:
+        const operation = async () => {
+            const response = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                    {
+                        role: "system",
+                        content: "Create simple, clear flashcards for studying."
+                    },
+                    { role: "user", content: prompt }
+                ],
+                temperature: 0.3,
+                max_tokens: SCHEMA_MAX_TOKENS.simple_flashcards || 1200,
+                response_format: { 
+                    type: "json_schema",
+                    json_schema: {
+                        name: "flashcard_batch",
+                        strict: true,
+                        schema: simpleFlashcardSchema
+                    }
+                }
+            });
 
-${topic}
-
-Focus on the most important and fundamental concepts first.
-
-Each flashcard must have ALL these elements:
-- term: Unique concept name
-- definition: Clear explanation with context
-- visualDescription: Mental imagery for memory
-- mnemonic: Memory device or acronym
-- multipleExamples: Array of exactly 3 real-world examples
-- commonMisconceptions: Array of exactly 3 common mistakes
-- connections: Array of exactly 3 related concepts
-- practiceQuestion: Self-test question
-- memoryTips: Study strategies
-- category: Subject area
-- difficulty: 1-5 scale
-- importance: 1-5 scale
-
-Return ONLY this JSON structure:
-{
-    "flashcards": [
-        {
-            "term": "Unique Concept Name",
-            "definition": "Clear definition with context",
-            "visualDescription": "Mental imagery description",
-            "mnemonic": "Memory device",
-            "multipleExamples": ["Example 1", "Example 2", "Example 3"],
-            "commonMisconceptions": ["Mistake 1", "Mistake 2", "Mistake 3"],
-            "connections": ["Related concept 1", "Related concept 2", "Related concept 3"],
-            "practiceQuestion": "Test question",
-            "memoryTips": "Study strategies",
-            "category": "Subject",
-            "difficulty": 3,
-            "importance": 4
-        }
-    ]
-}`;
+            const content = JSON.parse(response.choices[0].message.content);
+            return content.flashcards;
+        };
 
         try {
-            const result = await makeValidatedAPICall(prompt, flashcardBatchSchema, validateFlashcardBatch, 'flashcards', 'initial');
-            console.log(`✅ Generated ${result.flashcards.length} initial flashcards`);
-            return { flashcards: result.flashcards };
+            const flashcards = await retryWithBackoff(operation, 2, 200);
+            
+            // Track token usage for simple flashcards
+            if (options.sessionId) {
+                // Note: We don't have the usage data here, so we estimate
+                const estimatedTokens = estimateTokens(prompt) + 1200;
+                console.log(`💰 Estimated token usage for simple flashcards: ${estimatedTokens} tokens`);
+            }
+            
+            console.log(`✅ Generated ${flashcards.length} simple flashcards`);
+            return { flashcards };
         } catch (error) {
-            console.error(`❌ Failed to generate initial flashcards:`, error.message);
-            throw new Error(`Failed to generate initial flashcards: ${error.message}`);
+            console.error(`❌ Failed to generate flashcards:`, error.message);
+            throw new Error(`Failed to generate flashcards: ${error.message}`);
         }
     }
 
     // For other types, use existing single-call approach
     const prompts = {
-        summary: `Create a comprehensive study summary following educational best practices. Analyze the content for difficulty level, learning objectives, and optimal study approach.
+        summary: `Create a simple study summary with 5 key bullet points.
 
-            Content: ${text.substring(0, 8000)}
+            Content: ${text.substring(0, 3000)}
 
             Return ONLY valid JSON in this exact format:
             {
-                "overview": "Comprehensive overview in 2-3 sentences",
-                "difficultyLevel": "Beginner/Intermediate/Advanced",
-                "estimatedStudyTime": "X hours",
-                "learningObjectives": ["Students will be able to...", "Students will understand..."],
-                "keyPoints": ["Important concept 1", "Important concept 2"],
-                "criticalConcepts": [
-                    {
-                        "concept": "Main concept name",
-                        "explanation": "Clear explanation",
-                        "importance": "High/Medium/Low",
-                        "prerequisites": ["Required knowledge"]
-                    }
+                "bullets": [
+                    "Key point 1 (max 20 words)",
+                    "Key point 2 (max 20 words)",
+                    "Key point 3 (max 20 words)",
+                    "Key point 4 (max 20 words)",
+                    "Key point 5 (max 20 words)"
                 ],
-                "definitions": {"term": "clear definition"},
-                "studyStrategy": {
-                    "approach": "Best study method for this content",
-                    "focusAreas": ["area1", "area2"],
-                    "commonMistakes": ["mistake1", "mistake2"]
-                },
-                "assessmentTips": ["How to prepare for tests on this material"]
+                "overview": "Brief overview in 1-2 sentences",
+                "difficulty": "Beginner/Intermediate/Advanced"
             }`,
 
         knowledgeGaps: `Analyze this content and identify the prerequisite knowledge and potential difficult areas.
@@ -704,7 +1028,7 @@ Return ONLY this JSON structure:
                 messages: [
                     {
                         role: "system",
-                        content: "You are an expert educator. Always respond with valid JSON only. No markdown, no code blocks, just pure JSON. Ensure all JSON strings are properly escaped and terminated."
+                        content: "You are an expert educator. Generate content strictly according to the requested JSON format."
                     },
                     {
                         role: "user",
@@ -716,7 +1040,7 @@ Return ONLY this JSON structure:
                 response_format: { type: "json_object" }
             }),
             new Promise((_, reject) =>
-                setTimeout(() => reject(new Error(`OpenAI request timeout after 45 seconds`)), 45000)
+                setTimeout(() => reject(new Error(`OpenAI request timeout after 30 seconds`)), 30000)
             )
         ]);
 
@@ -726,19 +1050,11 @@ Return ONLY this JSON structure:
             throw new Error(`Empty response from OpenAI for ${type}`);
         }
 
-        let cleanedContent = rawContent.replace(/```json\n?/gi, '').replace(/```\n?/g, '').trim();
+        // Parse JSON directly - minimal cleanup for better reliability
+        const parsed = JSON.parse(rawContent);
+        console.log(`✅ Successfully generated ${type}`);
+        return parsed;
 
-        try {
-            const parsed = JSON.parse(cleanedContent);
-            console.log(`✅ Successfully generated ${type}`);
-            return parsed;
-        } catch (parseError) {
-            // Try cleaning common JSON issues
-            cleanedContent = cleanedContent.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
-            const parsed = JSON.parse(cleanedContent);
-            console.log(`✅ Successfully generated ${type} after cleanup`);
-            return parsed;
-        }
     } catch (error) {
         console.error(`❌ Error generating ${type}:`, error.message);
 
@@ -953,33 +1269,38 @@ app.get('/', (req, res) => {
     });
 });
 
-app.get('/health', (req, res) => {
-    const envStatus = {
-        mongodb: !!process.env.MONGODB_URI,
-        openai: !!process.env.OPENAI_API_KEY,
-        stripe_secret: !!process.env.STRIPE_SECRET_KEY,
-        stripe_publishable: !!process.env.STRIPE_PUBLISHABLE_KEY,
-        stripe_webhook: !!process.env.STRIPE_WEBHOOK_SECRET,
-        frontend_url: !!process.env.FRONTEND_URL,
-        jwt_secret: !!process.env.JWT_SECRET
-    };
-
-    const allConfigured = Object.values(envStatus).every(Boolean);
-
+// API usage stats endpoint
+app.get('/api/usage-stats', authenticateToken, (req, res) => {
+    const sessionStats = req.userId ? tokenUsage.sessions.get(req.userId) : null;
+    
+    // Calculate total cached tokens across all sessions
+    let totalCachedTokens = 0;
+    for (const session of tokenUsage.sessions.values()) {
+        totalCachedTokens += session.cachedTokens || 0;
+    }
+    
     res.json({
-        status: 'OK',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        environment: {
-            configured: envStatus,
-            all_required_set: allConfigured,
-            frontend_url: process.env.FRONTEND_URL || 'http://localhost:8080 (default)',
-            node_env: process.env.NODE_ENV || 'development'
-        }
+        total: {
+            tokens: tokenUsage.totalTokens,
+            cost: tokenUsage.totalCost.toFixed(4),
+            cachedTokens: totalCachedTokens,
+            averageTokensPerRequest: tokenUsage.totalTokens ? 
+                Math.round(tokenUsage.totalTokens / (tokenUsage.sessions.size || 1)) : 0
+        },
+        session: sessionStats || { tokens: 0, cost: 0, cachedTokens: 0 },
+        pricing: PRICING['gpt-4o-mini'],
+        optimization: {
+            cachedTokensSavings: `$${((totalCachedTokens / 1000000) * (PRICING['gpt-4o-mini'].input - PRICING['gpt-4o-mini'].cached_input)).toFixed(4)} saved from cached tokens`,
+            note: 'OpenAI automatically caches prompts >1024 tokens for 50% discount'
+        },
+        timestamp: new Date().toISOString()
     });
 });
 
-// Test endpoint for frontend connection
+// Enhanced health check endpoint with testing integration
+app.get('/health', backendTesting.healthCheck());
+
+// Test connection endpoint
 app.get('/test-connection', (req, res) => {
     res.json({
         message: 'Backend connection successful!',
@@ -988,6 +1309,26 @@ app.get('/test-connection', (req, res) => {
         userAgent: req.get('User-Agent')
     });
 });
+
+// API version of test connection endpoint for collaborative testing
+app.get('/api/test-connection', (req, res) => {
+    res.json({
+        message: 'API connection successful!',
+        timestamp: new Date().toISOString(),
+        server: 'StudyMaster AI Backend',
+        status: 'operational',
+        testing: {
+            collaborativeTesterCompatible: true,
+            endpoints: ['health', 'test-connection', 'testing-status'],
+            backendVersion: '1.0.0'
+        },
+        origin: req.get('Origin'),
+        userAgent: req.get('User-Agent')
+    });
+});
+
+// Testing status endpoint
+app.get('/api/testing-status', backendTesting.getTestingStatus());
 
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -1176,6 +1517,256 @@ app.post('/api/upload', authenticateToken, upload.array('files', 20), async (req
     }
 });
 
+// Get user files endpoint
+app.get('/api/files', authenticateToken, async (req, res) => {
+    try {
+        await initializeDatabase();
+        
+        if (req.userId === 'demo') {
+            // Return demo files or empty for demo users
+            res.json({ files: [] });
+            return;
+        }
+        
+        const files = await db.collection('files').find({ userId: req.userId })
+            .sort({ uploadedAt: -1 })
+            .project({ filename: 1, _id: 1, uploadedAt: 1, wordCount: 1 })
+            .toArray();
+            
+        // Convert _id to id for frontend compatibility
+        const formattedFiles = files.map(file => ({
+            id: file._id.toString(),
+            filename: file.filename,
+            uploadedAt: file.uploadedAt,
+            wordCount: file.wordCount
+        }));
+            
+        res.json({ files: formattedFiles });
+    } catch (error) {
+        console.error('❌ Error fetching files:', error);
+        res.status(500).json({ error: 'Failed to fetch files' });
+    }
+});
+
+// Create study session for Keep Going feature
+app.post('/api/sessions', authenticateToken, async (req, res) => {
+    try {
+        await initializeDatabase();
+        const { fileIds, topic } = req.body;
+        
+        // Get file content
+        const files = await db.collection('files').find({
+            _id: { $in: fileIds.map(id => new ObjectId(id)) },
+            userId: req.userId
+        }).toArray();
+        
+        if (!files.length) {
+            return res.status(404).json({ error: 'Files not found' });
+        }
+        
+        const combinedText = files.map(f => f.textContent).join('\n\n');
+        
+        // Create context summary (keep it short for speed)
+        const contextSummary = combinedText.substring(0, 800);
+        const topicKey = topic || `study_${Date.now()}`;
+        
+        // Create session
+        const session = {
+            userId: req.userId,
+            topicKey,
+            sourceFileIds: fileIds,
+            contextSummary,
+            currentBatch: 1,
+            totalGenerated: 0,
+            previousTopics: [],
+            createdAt: new Date(),
+            updatedAt: new Date()
+        };
+        
+        const result = await db.collection('study_sessions').insertOne(session);
+        const sessionId = result.insertedId.toString();
+        
+        // Generate first batch of 20 questions
+        console.log('🚀 Generating initial batch of 20 questions for session...');
+        const questions = await generateQuestionBatch(combinedText, { contextSummary });
+        
+        // Store questions with status tracking
+        const batch = {
+            sessionId: new ObjectId(sessionId),
+            batchNumber: 1,
+            questions: questions.map((q, idx) => ({
+                _id: new ObjectId(),
+                ...q,
+                status: 'unseen',
+                index: idx
+            })),
+            createdAt: new Date()
+        };
+        
+        await db.collection('question_batches').insertOne(batch);
+        
+        // Update session
+        await db.collection('study_sessions').updateOne(
+            { _id: new ObjectId(sessionId) },
+            { 
+                $set: { totalGenerated: 20 },
+                $push: { previousTopics: { $each: questions.slice(0, 5).map(q => q.question.substring(0, 30)) } }
+            }
+        );
+        
+        // Cache session for fast access
+        questionSessionCache.set(sessionId, {
+            contextSummary,
+            topicKey,
+            questions: batch.questions
+        });
+        
+        res.json({ 
+            sessionId,
+            initialQuestions: batch.questions.slice(0, 5) // Return first 5 questions
+        });
+        
+    } catch (error) {
+        console.error('❌ Error creating session:', error);
+        res.status(500).json({ error: 'Failed to create session' });
+    }
+});
+
+// Get next questions from session (Keep Going functionality)
+app.get('/api/sessions/:id/next', authenticateToken, async (req, res) => {
+    try {
+        await initializeDatabase();
+        const { id } = req.params;
+        const limit = parseInt(req.query.limit) || 5;
+        
+        // Try cache first
+        const cached = questionSessionCache.get(id);
+        if (cached) {
+            const unseenQuestions = cached.questions.filter(q => q.status === 'unseen').slice(0, limit);
+            if (unseenQuestions.length > 0) {
+                // Mark as shown
+                unseenQuestions.forEach(q => q.status = 'shown');
+                return res.json({ 
+                    questions: unseenQuestions,
+                    remaining: cached.questions.filter(q => q.status === 'unseen').length - unseenQuestions.length
+                });
+            }
+        }
+        
+        // Get from database
+        const batch = await db.collection('question_batches').findOne({
+            sessionId: new ObjectId(id),
+            'questions.status': 'unseen'
+        });
+        
+        if (!batch || !batch.questions) {
+            // Need to generate more questions
+            const session = await db.collection('study_sessions').findOne({ _id: new ObjectId(id) });
+            
+            if (!session) {
+                return res.status(404).json({ error: 'Session not found' });
+            }
+            
+            // Generate next batch
+            console.log('🔄 Generating next batch of 20 questions...');
+            const files = await db.collection('files').find({
+                _id: { $in: session.sourceFileIds.map(fid => new ObjectId(fid)) }
+            }).toArray();
+            
+            const combinedText = files.map(f => f.textContent).join('\n\n');
+            const questions = await generateQuestionBatch(combinedText, {
+                contextSummary: session.contextSummary,
+                previousTopics: session.previousTopics
+            });
+            
+            // Store new batch
+            const newBatch = {
+                sessionId: new ObjectId(id),
+                batchNumber: session.currentBatch + 1,
+                questions: questions.map((q, idx) => ({
+                    _id: new ObjectId(),
+                    ...q,
+                    status: 'unseen',
+                    index: idx + session.totalGenerated
+                })),
+                createdAt: new Date()
+            };
+            
+            await db.collection('question_batches').insertOne(newBatch);
+            
+            // Update session
+            await db.collection('study_sessions').updateOne(
+                { _id: new ObjectId(id) },
+                { 
+                    $set: { 
+                        currentBatch: session.currentBatch + 1,
+                        totalGenerated: session.totalGenerated + 20,
+                        updatedAt: new Date()
+                    },
+                    $push: { 
+                        previousTopics: { 
+                            $each: questions.slice(0, 5).map(q => q.question.substring(0, 30)) 
+                        }
+                    }
+                }
+            );
+            
+            // Update cache
+            questionSessionCache.set(id, {
+                contextSummary: session.contextSummary,
+                topicKey: session.topicKey,
+                questions: newBatch.questions
+            });
+            
+            const returnQuestions = newBatch.questions.slice(0, limit);
+            returnQuestions.forEach(q => q.status = 'shown');
+            
+            return res.json({ 
+                questions: returnQuestions,
+                remaining: 20 - limit,
+                newBatchGenerated: true
+            });
+        }
+        
+        // Get unseen questions
+        const unseenQuestions = batch.questions
+            .filter(q => q.status === 'unseen')
+            .slice(0, limit);
+        
+        if (unseenQuestions.length > 0) {
+            // Mark as shown in database
+            const questionIds = unseenQuestions.map(q => q._id);
+            await db.collection('question_batches').updateOne(
+                { _id: batch._id },
+                { 
+                    $set: {
+                        'questions.$[elem].status': 'shown',
+                        'questions.$[elem].seenAt': new Date()
+                    }
+                },
+                {
+                    arrayFilters: [{ 'elem._id': { $in: questionIds } }]
+                }
+            );
+            
+            res.json({ 
+                questions: unseenQuestions,
+                remaining: batch.questions.filter(q => q.status === 'unseen').length - unseenQuestions.length
+            });
+        } else {
+            res.json({ 
+                questions: [],
+                remaining: 0,
+                needsNewBatch: true
+            });
+        }
+        
+    } catch (error) {
+        console.error('❌ Error getting next questions:', error);
+        res.status(500).json({ error: 'Failed to get questions' });
+    }
+});
+
 app.post('/api/generate', authenticateToken, async (req, res) => {
     try {
         await initializeDatabase();
@@ -1246,36 +1837,102 @@ Ethical considerations include bias, privacy, job displacement, and AI safety.`,
             return res.status(400).json({ error: 'No text content found in uploaded files' });
         }
 
+        // Request coalescing - prevent duplicate processing
+        const requestKey = generateRequestKey(req.userId, fileIds, mode, combinedText.length);
+        
+        // Check if identical request is already in flight
+        if (inflightRequests.has(requestKey)) {
+            console.log('🔄 Coalescing duplicate request, waiting for existing generation...');
+            const result = await inflightRequests.get(requestKey);
+            return res.json(result);
+        }
+        
+        // Check cache for recent identical requests (5 minute TTL)
+        const cachedResult = contentCache.get(requestKey);
+        if (cachedResult && Date.now() - cachedResult.timestamp < 300000) {
+            console.log('✅ Returning cached result for identical request');
+            return res.json(cachedResult.data);
+        }
+
         let content = {};
-
-        try {
-            if (mode === 'comprehensive' || mode === 'summary') {
-                console.log('🔄 Generating summary...');
-                content.summary = await generateStudyContent(combinedText, 'summary');
-                console.log('✅ Summary generated successfully');
-            }
-
-            if (mode === 'comprehensive' || mode === 'practice') {
-                console.log('🔄 Generating questions...');
-                content.questions = await generateStudyContent(combinedText, 'questions');
-                console.log('✅ Questions generated successfully');
-            }
-
-            if (mode === 'comprehensive' || mode === 'flashcards') {
-                console.log('🔄 Generating flashcards...');
-                content.flashcards = await generateStudyContent(combinedText, 'flashcards');
-                console.log('✅ Flashcards generated successfully');
-            }
-
-            if (mode === 'gaps') {
-                console.log('🔄 Generating knowledge gaps...');
-                content.knowledgeGaps = await generateStudyContent(combinedText, 'knowledgeGaps');
-                console.log('✅ Knowledge gaps generated successfully');
-            }
-
-            console.log('🔄 Generating study plan...');
-            content.studyPlan = await generateStudyContent(combinedText, 'studyPlan', { days: 7 });
-            console.log('✅ Study plan generated successfully');
+        const generationPromise = (async () => {
+            try {
+                console.log(`🔄 Starting optimized parallel content generation for mode: ${mode}...`);
+                const startTime = Date.now();
+                
+                // Define content generation tasks based on mode
+                const tasks = [];
+                
+                if (mode === 'comprehensive') {
+                    // Optimize comprehensive mode to run all generation in parallel
+                    console.log('🚀 Starting parallel comprehensive generation...');
+                    
+                    // Run ALL content generation in parallel for maximum speed
+                    const comprehensiveTasks = [
+                        ['summary', generateStudyContent(combinedText, 'summary', { sessionId: req.userId })],
+                        ['studyPlan', generateStudyContent(combinedText, 'studyPlan', { days: 7, sessionId: req.userId })],
+                        ['questions', generateStudyContent(combinedText, 'questions', { sessionId: req.userId })],
+                        ['flashcards', generateStudyContent(combinedText, 'flashcards', { sessionId: req.userId })]
+                    ];
+                    
+                    console.log('⚡ Generating all content types in parallel (4 tasks)...');
+                    const comprehensiveResults = await Promise.allSettled(comprehensiveTasks.map(([key, promise]) => 
+                        promise.then(result => ({ key, result }))
+                    ));
+                    
+                    // Process all results
+                    for (const result of comprehensiveResults) {
+                        if (result.status === 'fulfilled') {
+                            const { key, result: data } = result.value;
+                            content[key] = data;
+                            console.log(`✅ ${key} generated successfully`);
+                        } else {
+                            console.error(`❌ Failed to generate ${result.reason?.message || 'unknown content'}`);
+                        }
+                    }
+                    
+                    console.log('🎯 Parallel comprehensive generation completed');
+                    
+                } else {
+                    // Individual modes with parallel execution where possible
+                    if (mode === 'summary') {
+                        tasks.push(['summary', generateStudyContent(combinedText, 'summary', { sessionId: req.userId })]);
+                    }
+                    if (mode === 'practice' || mode === 'questions') {
+                        tasks.push(['questions', generateStudyContent(combinedText, 'questions', { sessionId: req.userId })]);
+                    }
+                    if (mode === 'flashcards') {
+                        tasks.push(['flashcards', generateStudyContent(combinedText, 'flashcards', { sessionId: req.userId })]);
+                    }
+                    if (mode === 'gaps') {
+                        tasks.push(['knowledgeGaps', generateStudyContent(combinedText, 'knowledgeGaps', { sessionId: req.userId })]);
+                    }
+                    // Only generate study plan if no specific mode requested or if summary mode
+                    if (mode === 'summary') {
+                        tasks.push(['studyPlan', generateStudyContent(combinedText, 'studyPlan', { days: 7, sessionId: req.userId })]);
+                    }
+                    
+                    // Execute all tasks in parallel using Promise.allSettled for better error handling
+                    console.log(`⚡ Executing ${tasks.length} content generation tasks in parallel...`);
+                    const results = await Promise.allSettled(tasks.map(([key, promise]) => 
+                        promise.then(result => ({ key, result }))
+                    ));
+                    
+                    // Process results and handle any failures gracefully
+                    for (const result of results) {
+                        if (result.status === 'fulfilled') {
+                            const { key, result: data } = result.value;
+                            content[key] = data;
+                            console.log(`✅ ${key} generated successfully`);
+                        } else {
+                            console.error(`❌ Failed to generate content:`, result.reason.message);
+                            // Continue with partial results rather than failing completely
+                        }
+                    }
+                }
+                
+                const endTime = Date.now();
+                console.log(`⚡ Parallel content generation completed in ${endTime - startTime}ms`);
 
             if (content.flashcards && content.flashcards.flashcards) {
                 content.flashcards = content.flashcards.flashcards;
@@ -1289,25 +1946,45 @@ Ethical considerations include bias, privacy, job displacement, and AI safety.`,
                 }
             }
 
-            const session = {
-                userId: req.userId,
-                fileIds,
-                content,
-                mode,
-                createdAt: new Date()
-            };
+                const session = {
+                    userId: req.userId,
+                    fileIds,
+                    content,
+                    mode,
+                    createdAt: new Date()
+                };
 
-            console.log('💾 Saving study session to database...');
-            const result = await db.collection('studySessions').insertOne(session);
-            console.log('✅ Study session saved successfully');
+                console.log('💾 Saving study session to database...');
+                const dbResult = await db.collection('studySessions').insertOne(session);
+                console.log('✅ Study session saved successfully');
 
-            res.json({
-                sessionId: result.insertedId,
-                content: content
-            });
-        } catch (aiError) {
-            console.error('❌ AI content generation failed:', aiError);
-            throw new Error(`AI content generation failed: ${aiError.message}`);
+                const responseData = {
+                    sessionId: dbResult.insertedId,
+                    content: content
+                };
+                
+                // Cache the result for future identical requests
+                contentCache.set(requestKey, {
+                    data: responseData,
+                    timestamp: Date.now()
+                });
+                
+                return responseData;
+            } catch (error) {
+                console.error('❌ Content generation failed:', error);
+                throw error;
+            }
+        })();
+        
+        // Store promise in inflight requests to enable coalescing
+        inflightRequests.set(requestKey, generationPromise);
+        
+        try {
+            const result = await generationPromise;
+            res.json(result);
+        } finally {
+            // Clean up inflight request
+            inflightRequests.delete(requestKey);
         }
     } catch (error) {
         console.error('❌ Generate endpoint error:', error);
@@ -1354,7 +2031,7 @@ app.post('/api/generate-more-flashcards', authenticateToken, async (req, res) =>
         const usedTermsList = existingTerms.join(', ');
         const topic = contentChunks[Math.floor(Math.random() * contentChunks.length)]; // Random chunk for variety
 
-        const prompt = `Create EXACTLY ${MORE_BATCH_SIZE} new premium flashcards with enhanced features from this content:
+        const prompt = `Create EXACTLY ${MORE_BATCH_SIZE} premium flashcards with enhanced features from this content:
 
 ${topic}
 
@@ -1396,7 +2073,7 @@ Return ONLY this JSON structure:
     ]
 }`;
 
-        const result = await makeValidatedAPICall(prompt, flashcardBatchSchema, validateFlashcardBatch, 'flashcards', 'additional');
+        const result = await makeValidatedAPICall(prompt, flashcardBatchSchema, validateFlashcardBatch, 'batch_flashcards', 'additional', req.userId);
 
         console.log(`✅ Generated ${result.flashcards.length} additional flashcards`);
         res.json({ success: true, flashcards: result.flashcards });
@@ -1419,15 +2096,133 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
         let session = null;
 
         if (req.userId === 'demo') {
-            // Demo mode - create mock session
+            // Demo mode - create mock session with template content
             session = {
                 _id: 'demo-session',
                 userId: 'demo',
                 fileIds: ['demo-file'],
                 content: {
-                    summary: { overview: "Demo AI content session" },
-                    flashcards: [],
-                    questions: []
+                    summary: { overview: "Demo AI content session covering machine learning fundamentals" },
+                    flashcards: [
+                        {
+                            _id: 'demo-card-1',
+                            term: 'Machine Learning',
+                            definition: 'A subset of AI that enables systems to automatically learn and improve from experience without being explicitly programmed',
+                            visualDescription: 'Imagine a student who learns to recognize patterns by studying many examples',
+                            mnemonic: 'ML = Making Learning automatic',
+                            multipleExamples: ['Image recognition systems', 'Recommendation algorithms', 'Spam email detection'],
+                            commonMisconceptions: ['ML is not just automation', 'It requires large amounts of data', 'Not all AI is machine learning'],
+                            connections: ['Connects to neural networks', 'Foundation for deep learning', 'Used in data science'],
+                            practiceQuestion: 'How does supervised learning differ from unsupervised learning?',
+                            memoryTips: 'Think of ML as teaching computers to learn like humans do - through examples and practice',
+                            category: 'AI Fundamentals',
+                            difficulty: 3,
+                            importance: 5
+                        },
+                        {
+                            _id: 'demo-card-2',
+                            term: 'Neural Network',
+                            definition: 'A computing system inspired by biological neural networks that uses interconnected nodes to process information',
+                            visualDescription: 'Like a web of connected brain cells, each node processes and passes information',
+                            mnemonic: 'Neural = Network of artificial neurons',
+                            multipleExamples: ['Image classification networks', 'Language processing models', 'Voice recognition systems'],
+                            commonMisconceptions: ['Not exactly like human brains', 'Requires training to function', 'More nodes doesn\'t always mean better'],
+                            connections: ['Foundation of deep learning', 'Uses machine learning principles', 'Inspired by neuroscience'],
+                            practiceQuestion: 'What role do weights and biases play in neural networks?',
+                            memoryTips: 'Picture neurons in your brain - that\'s the inspiration for artificial neural networks',
+                            category: 'AI Fundamentals',
+                            difficulty: 4,
+                            importance: 4
+                        },
+                        {
+                            _id: 'demo-card-3',
+                            term: 'Deep Learning',
+                            definition: 'A subset of machine learning that uses neural networks with multiple layers to model complex patterns in data',
+                            visualDescription: 'Like a multi-story building where each floor processes different aspects of information',
+                            mnemonic: 'Deep = Multiple layers Deep down',
+                            multipleExamples: ['Computer vision systems', 'Natural language processing', 'Autonomous vehicle perception'],
+                            commonMisconceptions: ['Not always better than simple ML', 'Requires significant computational power', 'Black box nature can be problematic'],
+                            connections: ['Advanced form of neural networks', 'Powers modern AI applications', 'Requires machine learning foundations'],
+                            practiceQuestion: 'Why are multiple layers important in deep learning architectures?',
+                            memoryTips: 'The \'deep\' refers to many layers, like diving deep into an ocean of data',
+                            category: 'Advanced AI',
+                            difficulty: 4,
+                            importance: 5
+                        },
+                        {
+                            _id: 'demo-card-4',
+                            term: 'Natural Language Processing',
+                            definition: 'A field of AI focused on enabling computers to understand, interpret, and generate human language',
+                            visualDescription: 'Like a universal translator that understands the meaning behind words and sentences',
+                            mnemonic: 'NLP = Natural Language Processing for computers',
+                            multipleExamples: ['Chatbots and virtual assistants', 'Language translation services', 'Sentiment analysis tools'],
+                            commonMisconceptions: ['Not just keyword matching', 'Context matters significantly', 'Cultural nuances are challenging'],
+                            connections: ['Uses machine learning techniques', 'Often employs neural networks', 'Combines linguistics with AI'],
+                            practiceQuestion: 'How does tokenization help in natural language processing?',
+                            memoryTips: 'Think of NLP as teaching computers to \'speak human\' naturally',
+                            category: 'AI Applications',
+                            difficulty: 3,
+                            importance: 4
+                        },
+                        {
+                            _id: 'demo-card-5',
+                            term: 'Computer Vision',
+                            definition: 'A field of AI that enables computers to interpret and understand visual information from the world',
+                            visualDescription: 'Like giving computers eyes and the brain power to understand what they see',
+                            mnemonic: 'CV = Computer Vision for seeing and understanding',
+                            multipleExamples: ['Medical image analysis', 'Facial recognition systems', 'Object detection in autonomous vehicles'],
+                            commonMisconceptions: ['Not just image filtering', 'Requires understanding context', 'Lighting and angles affect performance'],
+                            connections: ['Heavily uses deep learning', 'Applications in robotics', 'Combines with sensor technology'],
+                            practiceQuestion: 'What are the main challenges in computer vision compared to human vision?',
+                            memoryTips: 'Computer Vision is like teaching a computer to \'see\' and understand images like humans do',
+                            category: 'AI Applications',
+                            difficulty: 4,
+                            importance: 4
+                        }
+                    ],
+                    questions: {
+                        allQuestions: [
+                            {
+                                question: "What is the primary characteristic that defines machine learning?",
+                                options: ["Learning from data without explicit programming", "Using only rule-based systems", "Requiring manual updates for new scenarios", "Operating without any training data"],
+                                correctAnswer: "Learning from data without explicit programming",
+                                explanation: "Machine learning's key feature is its ability to learn and improve from data automatically, without being explicitly programmed for every scenario.",
+                                difficulty: 2,
+                                topic: "Machine Learning Fundamentals",
+                                type: "direct",
+                                learningObjective: "Understand the core definition of machine learning",
+                                hints: ["Think about what makes ML different from traditional programming"],
+                                commonMistakes: ["Confusing ML with simple automation"],
+                                timeEstimate: "2 minutes"
+                            },
+                            {
+                                question: "In a neural network, what role do weights play?",
+                                options: ["They determine the strength of connections between neurons", "They count the number of layers", "They store the training data", "They determine the network architecture"],
+                                correctAnswer: "They determine the strength of connections between neurons",
+                                explanation: "Weights in neural networks control how much influence one neuron has on another, essentially determining the strength of connections.",
+                                difficulty: 3,
+                                topic: "Neural Networks",
+                                type: "direct",
+                                learningObjective: "Understand the function of weights in neural networks",
+                                hints: ["Consider how neurons communicate with each other"],
+                                commonMistakes: ["Thinking weights are just storage for data"],
+                                timeEstimate: "2 minutes"
+                            },
+                            {
+                                question: "What distinguishes deep learning from traditional machine learning?",
+                                options: ["Multiple layers of neural networks", "Faster processing speed", "Less data requirements", "Simpler algorithms"],
+                                correctAnswer: "Multiple layers of neural networks",
+                                explanation: "Deep learning uses neural networks with multiple hidden layers (\"deep\" architecture) to learn complex patterns, unlike traditional ML which often uses simpler, single-layer approaches.",
+                                difficulty: 3,
+                                topic: "Deep Learning",
+                                type: "direct",
+                                learningObjective: "Differentiate deep learning from traditional ML approaches",
+                                hints: ["The word 'deep' refers to the architecture"],
+                                commonMistakes: ["Thinking deep learning is always better than traditional ML"],
+                                timeEstimate: "2 minutes"
+                            }
+                        ]
+                    }
                 },
                 mode: 'comprehensive',
                 createdAt: new Date()
@@ -1538,11 +2333,21 @@ app.post('/api/spaced-repetition/review', authenticateToken, async (req, res) =>
         let card = null;
 
         if (req.userId === 'demo') {
-            // Demo mode - simulate card data
+            // Demo mode - simulate template format card data
             card = {
                 _id: 'demo-card',
                 term: 'Machine Learning',
-                definition: 'A subset of AI that learns from data',
+                definition: 'A subset of AI that enables systems to automatically learn and improve from experience without being explicitly programmed',
+                visualDescription: 'Imagine a student who learns to recognize patterns by studying many examples',
+                mnemonic: 'ML = Making Learning automatic',
+                multipleExamples: ['Image recognition systems', 'Recommendation algorithms', 'Spam email detection'],
+                commonMisconceptions: ['ML is not just automation', 'It requires large amounts of data', 'Not all AI is machine learning'],
+                connections: ['Connects to neural networks', 'Foundation for deep learning', 'Used in data science'],
+                practiceQuestion: 'How does supervised learning differ from unsupervised learning?',
+                memoryTips: 'Think of ML as teaching computers to learn like humans do - through examples and practice',
+                category: 'AI Fundamentals',
+                difficulty: 3,
+                importance: 5,
                 repetitions: 0,
                 easeFactor: 2.5,
                 interval: 1,
@@ -1605,23 +2410,82 @@ app.get('/api/spaced-repetition/due/:userId', authenticateToken, async (req, res
         let dueCards = [];
 
         if (req.userId === 'demo') {
-            // Demo mode - return sample cards
+            // Demo mode - return 5 sample cards for template format
             dueCards = [
                 {
                     _id: 'demo-card-1',
                     term: 'Machine Learning',
-                    definition: 'A subset of AI that learns from data',
+                    definition: 'A subset of AI that enables systems to automatically learn and improve from experience without being explicitly programmed',
+                    visualDescription: 'Imagine a student who learns to recognize patterns by studying many examples',
+                    mnemonic: 'ML = Making Learning automatic',
+                    multipleExamples: ['Image recognition systems', 'Recommendation algorithms', 'Spam email detection'],
+                    commonMisconceptions: ['ML is not just automation', 'It requires large amounts of data', 'Not all AI is machine learning'],
+                    connections: ['Connects to neural networks', 'Foundation for deep learning', 'Used in data science'],
+                    practiceQuestion: 'How does supervised learning differ from unsupervised learning?',
+                    memoryTips: 'Think of ML as teaching computers to learn like humans do - through examples and practice',
                     category: 'AI Fundamentals',
-                    importance: 5,
-                    difficulty: 3
+                    difficulty: 3,
+                    importance: 5
                 },
                 {
                     _id: 'demo-card-2',
                     term: 'Neural Network',
-                    definition: 'Computing system inspired by biological neural networks',
+                    definition: 'A computing system inspired by biological neural networks that uses interconnected nodes to process information',
+                    visualDescription: 'Like a web of connected brain cells, each node processes and passes information',
+                    mnemonic: 'Neural = Network of artificial neurons',
+                    multipleExamples: ['Image classification networks', 'Language processing models', 'Voice recognition systems'],
+                    commonMisconceptions: ['Not exactly like human brains', 'Requires training to function', 'More nodes doesn\'t always mean better'],
+                    connections: ['Foundation of deep learning', 'Uses machine learning principles', 'Inspired by neuroscience'],
+                    practiceQuestion: 'What role do weights and biases play in neural networks?',
+                    memoryTips: 'Picture neurons in your brain - that\'s the inspiration for artificial neural networks',
                     category: 'AI Fundamentals',
-                    importance: 4,
-                    difficulty: 4
+                    difficulty: 4,
+                    importance: 4
+                },
+                {
+                    _id: 'demo-card-3',
+                    term: 'Deep Learning',
+                    definition: 'A subset of machine learning that uses neural networks with multiple layers to model complex patterns in data',
+                    visualDescription: 'Like a multi-story building where each floor processes different aspects of information',
+                    mnemonic: 'Deep = Multiple layers Deep down',
+                    multipleExamples: ['Computer vision systems', 'Natural language processing', 'Autonomous vehicle perception'],
+                    commonMisconceptions: ['Not always better than simple ML', 'Requires significant computational power', 'Black box nature can be problematic'],
+                    connections: ['Advanced form of neural networks', 'Powers modern AI applications', 'Requires machine learning foundations'],
+                    practiceQuestion: 'Why are multiple layers important in deep learning architectures?',
+                    memoryTips: 'The \'deep\' refers to many layers, like diving deep into an ocean of data',
+                    category: 'Advanced AI',
+                    difficulty: 4,
+                    importance: 5
+                },
+                {
+                    _id: 'demo-card-4',
+                    term: 'Natural Language Processing',
+                    definition: 'A field of AI focused on enabling computers to understand, interpret, and generate human language',
+                    visualDescription: 'Like a universal translator that understands the meaning behind words and sentences',
+                    mnemonic: 'NLP = Natural Language Processing for computers',
+                    multipleExamples: ['Chatbots and virtual assistants', 'Language translation services', 'Sentiment analysis tools'],
+                    commonMisconceptions: ['Not just keyword matching', 'Context matters significantly', 'Cultural nuances are challenging'],
+                    connections: ['Uses machine learning techniques', 'Often employs neural networks', 'Combines linguistics with AI'],
+                    practiceQuestion: 'How does tokenization help in natural language processing?',
+                    memoryTips: 'Think of NLP as teaching computers to \'speak human\' naturally',
+                    category: 'AI Applications',
+                    difficulty: 3,
+                    importance: 4
+                },
+                {
+                    _id: 'demo-card-5',
+                    term: 'Computer Vision',
+                    definition: 'A field of AI that enables computers to interpret and understand visual information from the world',
+                    visualDescription: 'Like giving computers eyes and the brain power to understand what they see',
+                    mnemonic: 'CV = Computer Vision for seeing and understanding',
+                    multipleExamples: ['Medical image analysis', 'Facial recognition systems', 'Object detection in autonomous vehicles'],
+                    commonMisconceptions: ['Not just image filtering', 'Requires understanding context', 'Lighting and angles affect performance'],
+                    connections: ['Heavily uses deep learning', 'Applications in robotics', 'Combines with sensor technology'],
+                    practiceQuestion: 'What are the main challenges in computer vision compared to human vision?',
+                    memoryTips: 'Computer Vision is like teaching a computer to \'see\' and understand images like humans do',
+                    category: 'AI Applications',
+                    difficulty: 4,
+                    importance: 4
                 }
             ];
         } else if (ObjectId.isValid(req.userId)) {
@@ -1838,83 +2702,113 @@ app.post('/webhook/stripe', express.raw({type: 'application/json'}), async (req,
     }
 });
 
+// DEPRECATED: Use /api/sessions endpoint instead
+// Keeping for backward compatibility but redirecting to sessions
 app.post('/api/adaptive-practice', authenticateToken, async (req, res) => {
     try {
         await initializeDatabase();
-        const { weakAreas, difficulty, topic, previousAnswers } = req.body;
+        const { fileIds, weakAreas, difficulty, topic, previousAnswers } = req.body;
 
-        console.log('🎯 Generating adaptive practice questions for weak areas:', weakAreas);
+        console.log('⚠️ DEPRECATED: /api/adaptive-practice called, redirecting to sessions...');
+        console.log('🎯 Generating template-based Keep Going questions (7 direct + 4 twisted)...');
 
-        // Enhanced prompt that focuses on weak areas and uses external knowledge
-        const adaptivePrompt = `You are an expert educator creating targeted practice questions. Generate 15 NEW practice questions focusing on areas where the student is struggling.
+        // Get the user's uploaded content for generating new template questions
+        let contentText = 'General study material';
 
-Student's weak areas: ${weakAreas?.join(', ') || 'General review'}
-Difficulty level: ${difficulty || 'Mixed'}
-Topic: ${topic || 'General'}
-Previous incorrect answers: ${JSON.stringify(previousAnswers || [])}
+        if (fileIds && fileIds.length > 0 && req.userId !== 'demo') {
+            const files = await db.collection('files').find({
+                _id: { $in: fileIds.filter(id => ObjectId.isValid(id)).map(id => new ObjectId(id)) },
+                userId: req.userId
+            }).toArray();
 
-Create questions that:
-1. Target the specific weak areas identified
-2. Use different question formats than before
-3. Include step-by-step explanations
-4. Provide hints and common mistake warnings
-5. Draw from both provided content AND standard curriculum knowledge
+            if (files.length > 0) {
+                contentText = files.map(file => file.textContent || file.content).join('\n\n');
+            }
+        }
 
-Generate a mix of:
-- 8 Multiple choice questions
-- 4 Short answer questions
-- 3 Problem-solving questions
+        // Generate new 7 direct + 4 twisted questions using template format
+        const directPrompt = `Generate 7 NEW practice questions directly from this content, different from previous questions. Focus on areas where the student struggled: ${weakAreas?.join(', ') || 'General review'}.
 
-Return ONLY this JSON:
+Content: ${contentText.substring(0, 6000)}
+
+Focus on:
+- Key concepts the student got wrong before
+- Different aspects of the same topics  
+- Reinforcement of fundamental principles
+- Alternative ways to test the same knowledge
+
+Return ONLY valid JSON:
 {
-    "adaptiveQuestions": [
+    "questions": [
         {
-            "type": "multiple_choice",
-            "question": "Question text",
-            "options": ["A) Option 1", "B) Option 2", "C) Option 3", "D) Option 4"],
-            "correctAnswer": "A) Option 1",
-            "explanation": "Detailed explanation why this is correct",
+            "question": "New question about the content",
+            "options": ["Option A", "Option B", "Option C", "Option D"],
+            "correctAnswer": "Option A",
+            "explanation": "Clear explanation",
+            "difficulty": 2,
+            "topic": "Topic area",
+            "type": "direct",
+            "learningObjective": "What this reinforces",
             "hints": ["Helpful hint"],
-            "commonMistakes": ["Why students choose wrong answers"],
-            "difficulty": 3,
-            "focusArea": "Specific weak area this addresses"
+            "commonMistakes": ["Common mistake"],
+            "timeEstimate": "2 minutes"
         }
     ]
 }`;
 
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-                {
-                    role: "system",
-                    content: "You are an expert educator specializing in adaptive learning. Always respond with valid JSON only."
-                },
-                {
-                    role: "user",
-                    content: adaptivePrompt
-                }
-            ],
-            temperature: 0.8,
-            max_tokens: 3000,
-            response_format: { type: "json_object" }
-        });
+        const twistedPrompt = `Generate 4 NEW "twisted" application questions from this content, focusing on weak areas: ${weakAreas?.join(', ') || 'General review'}.
 
-        const content = response.choices[0].message.content;
-        const adaptiveQuestions = JSON.parse(content);
+Content: ${contentText.substring(0, 6000)}
 
-        console.log('✅ Generated adaptive practice questions:', adaptiveQuestions.adaptiveQuestions?.length || 0);
+Focus on:
+- Real-world applications of concepts the student missed
+- Creative scenarios using the same principles
+- Cross-connections between different concepts
+- Practical problem-solving situations
+
+Return ONLY valid JSON:
+{
+    "questions": [
+        {
+            "question": "Creative application question",
+            "options": ["Option A", "Option B", "Option C", "Option D"],
+            "correctAnswer": "Option A",
+            "explanation": "Application explanation",
+            "difficulty": 3,
+            "topic": "Applied scenario",
+            "type": "twisted",
+            "learningObjective": "Practical application",
+            "hints": ["Application hint"],
+            "commonMistakes": ["Application mistake"],
+            "timeEstimate": "3 minutes"
+        }
+    ]
+}`;
+
+        // Generate both sets of questions
+        const directResult = await makeValidatedAPICall(directPrompt, templateQuestionSchema, validateTemplateQuestions, 'template_questions', 'keep-going-direct', req.userId);
+        const twistedResult = await makeValidatedAPICall(twistedPrompt, templateQuestionSchema, validateTemplateQuestions, 'template_questions', 'keep-going-twisted', req.userId);
+
+        const allQuestions = [...(directResult.questions || []), ...(twistedResult.questions || [])];
+
+        console.log(`✅ Generated Keep Going questions: ${directResult.questions?.length || 0} direct + ${twistedResult.questions?.length || 0} twisted = ${allQuestions.length} total`);
 
         res.json({
             success: true,
-            questions: adaptiveQuestions.adaptiveQuestions || [],
+            questions: allQuestions,
             generatedAt: new Date(),
-            focusAreas: weakAreas
+            focusAreas: weakAreas,
+            template: {
+                directQuestions: directResult.questions?.length || 0,
+                twistedQuestions: twistedResult.questions?.length || 0,
+                total: allQuestions.length
+            }
         });
 
     } catch (error) {
-        console.error('❌ Adaptive practice generation error:', error);
+        console.error('❌ Template Keep Going generation error:', error);
         res.status(500).json({
-            error: 'Failed to generate adaptive practice questions',
+            error: 'Failed to generate Keep Going questions',
             details: error.message
         });
     }
@@ -1944,12 +2838,149 @@ app.get('/api/content/:type', authenticateToken, async (req, res) => {
                     }
                 ],
                 questions: {
-                    multipleChoice: [
+                    allQuestions: [
                         {
-                            question: "What is machine learning?",
-                            options: ["A) Subset of AI", "B) Type of computer", "C) Programming language", "D) Database"],
-                            correctAnswer: "A) Subset of AI",
-                            explanation: "Machine learning is indeed a subset of artificial intelligence"
+                            question: "What is the primary characteristic that defines machine learning?",
+                            options: ["Learning from data without explicit programming", "Using only rule-based systems", "Requiring manual updates for new scenarios", "Operating without any training data"],
+                            correctAnswer: "Learning from data without explicit programming",
+                            explanation: "Machine learning's key feature is its ability to learn and improve from data automatically, without being explicitly programmed for every scenario.",
+                            difficulty: 2,
+                            topic: "Machine Learning Fundamentals",
+                            type: "direct",
+                            learningObjective: "Understand the core definition of machine learning",
+                            hints: ["Think about what makes ML different from traditional programming"],
+                            commonMistakes: ["Confusing ML with simple automation"],
+                            timeEstimate: "2 minutes"
+                        },
+                        {
+                            question: "In a neural network, what role do weights play?",
+                            options: ["They determine the strength of connections between neurons", "They count the number of layers", "They store the training data", "They determine the network architecture"],
+                            correctAnswer: "They determine the strength of connections between neurons",
+                            explanation: "Weights in neural networks control how much influence one neuron has on another, essentially determining the strength of connections.",
+                            difficulty: 3,
+                            topic: "Neural Networks",
+                            type: "direct",
+                            learningObjective: "Understand the function of weights in neural networks",
+                            hints: ["Consider how neurons communicate with each other"],
+                            commonMistakes: ["Thinking weights are just storage for data"],
+                            timeEstimate: "2 minutes"
+                        },
+                        {
+                            question: "What distinguishes deep learning from traditional machine learning?",
+                            options: ["Multiple layers of neural networks", "Faster processing speed", "Less data requirements", "Simpler algorithms"],
+                            correctAnswer: "Multiple layers of neural networks",
+                            explanation: "Deep learning uses neural networks with multiple hidden layers (\"deep\" architecture) to learn complex patterns, unlike traditional ML which often uses simpler, single-layer approaches.",
+                            difficulty: 3,
+                            topic: "Deep Learning",
+                            type: "direct",
+                            learningObjective: "Differentiate deep learning from traditional ML approaches",
+                            hints: ["The word 'deep' refers to the architecture"],
+                            commonMistakes: ["Thinking deep learning is always better than traditional ML"],
+                            timeEstimate: "2 minutes"
+                        },
+                        {
+                            question: "What is tokenization in natural language processing?",
+                            options: ["Breaking text into smaller units like words or sentences", "Translating between languages", "Checking grammar and spelling", "Generating new text content"],
+                            correctAnswer: "Breaking text into smaller units like words or sentences",
+                            explanation: "Tokenization is the process of splitting text into individual units (tokens) such as words, phrases, or sentences, which is a fundamental preprocessing step in NLP.",
+                            difficulty: 2,
+                            topic: "Natural Language Processing",
+                            type: "direct",
+                            learningObjective: "Understand basic NLP preprocessing techniques",
+                            hints: ["Think about how you would break down a sentence for analysis"],
+                            commonMistakes: ["Confusing tokenization with translation"],
+                            timeEstimate: "2 minutes"
+                        },
+                        {
+                            question: "What makes computer vision challenging compared to human vision?",
+                            options: ["Computers lack contextual understanding and are sensitive to variations", "Computers process images too slowly", "Images contain too much information", "Computer screens have poor resolution"],
+                            correctAnswer: "Computers lack contextual understanding and are sensitive to variations",
+                            explanation: "Unlike humans who easily understand context and adapt to variations in lighting, angle, and perspective, computers struggle with these variations and need extensive training to achieve robust vision.",
+                            difficulty: 3,
+                            topic: "Computer Vision",
+                            type: "direct",
+                            learningObjective: "Understand the challenges in computer vision systems",
+                            hints: ["Compare how easily humans recognize objects vs computers"],
+                            commonMistakes: ["Thinking computer vision is just about image quality"],
+                            timeEstimate: "2 minutes"
+                        },
+                        {
+                            question: "Which type of machine learning would be best for email spam detection?",
+                            options: ["Supervised learning with labeled spam/not spam examples", "Unsupervised learning without any labels", "Reinforcement learning with rewards", "Transfer learning from image recognition"],
+                            correctAnswer: "Supervised learning with labeled spam/not spam examples",
+                            explanation: "Supervised learning is ideal for spam detection because we can train the model using examples of emails that have been labeled as spam or not spam, allowing it to learn the patterns that distinguish between them.",
+                            difficulty: 3,
+                            topic: "ML Applications",
+                            type: "direct",
+                            learningObjective: "Apply ML concepts to real-world problems",
+                            hints: ["Consider what type of training data would be available"],
+                            commonMistakes: ["Thinking unsupervised learning works better without examples"],
+                            timeEstimate: "3 minutes"
+                        },
+                        {
+                            question: "What is the main advantage of using pre-trained models in deep learning?",
+                            options: ["They reduce training time and data requirements", "They are always more accurate", "They use less computational power during inference", "They work without any additional training"],
+                            correctAnswer: "They reduce training time and data requirements",
+                            explanation: "Pre-trained models have already learned general features from large datasets, so they can be fine-tuned for specific tasks with less data and training time compared to training from scratch.",
+                            difficulty: 3,
+                            topic: "Transfer Learning",
+                            type: "direct",
+                            learningObjective: "Understand the benefits of transfer learning and pre-trained models",
+                            hints: ["Think about reusing knowledge that's already been learned"],
+                            commonMistakes: ["Assuming pre-trained models work perfectly without any adaptation"],
+                            timeEstimate: "3 minutes"
+                        },
+                        {
+                            question: "A hospital wants to implement an AI system to help doctors diagnose skin cancer from photos. What ethical considerations should they prioritize?",
+                            options: ["Ensuring transparency, avoiding bias, and maintaining human oversight", "Only focusing on accuracy of the AI system", "Replacing doctors completely to reduce costs", "Making the system as complex as possible for better results"],
+                            correctAnswer: "Ensuring transparency, avoiding bias, and maintaining human oversight",
+                            explanation: "Medical AI systems require careful ethical consideration including transparent decision-making processes, bias testing across different demographics, and maintaining human doctors in the decision loop for patient safety and accountability.",
+                            difficulty: 4,
+                            topic: "AI Ethics in Healthcare",
+                            type: "twisted",
+                            learningObjective: "Apply ethical principles to real-world AI applications",
+                            hints: ["Consider the life-and-death implications of medical AI decisions"],
+                            commonMistakes: ["Focusing only on technical performance without considering ethical implications"],
+                            timeEstimate: "4 minutes"
+                        },
+                        {
+                            question: "You're building a recommendation system for a streaming platform. Users complain it only suggests popular content. How would you address this filter bubble problem?",
+                            options: ["Introduce diversity metrics and exploration mechanisms in the algorithm", "Only recommend the most popular content to satisfy most users", "Let users manually search without any recommendations", "Use only collaborative filtering without content analysis"],
+                            correctAnswer: "Introduce diversity metrics and exploration mechanisms in the algorithm",
+                            explanation: "To break filter bubbles, recommendation systems should include diversity metrics to ensure variety, exploration mechanisms to introduce new content, and balance between user preferences and content discovery to provide a richer user experience.",
+                            difficulty: 4,
+                            topic: "Recommendation Systems Design",
+                            type: "twisted",
+                            learningObjective: "Design AI systems that balance user satisfaction with broader goals",
+                            hints: ["Think about the trade-off between giving users what they want vs what they might discover"],
+                            commonMistakes: ["Optimizing only for engagement metrics without considering user experience diversity"],
+                            timeEstimate: "4 minutes"
+                        },
+                        {
+                            question: "A self-driving car company wants to train their AI using data from different countries. What challenges might they face and how should they address them?",
+                            options: ["Different traffic rules, road signs, and driving cultures require localized training data and testing", "All countries have the same traffic patterns, so one dataset works globally", "Just translate the text in road signs to local languages", "Use the same model everywhere since cars are universal"],
+                            correctAnswer: "Different traffic rules, road signs, and driving cultures require localized training data and testing",
+                            explanation: "Autonomous vehicles must account for local variations in traffic laws, road signage, driving behaviors, and cultural norms. This requires collecting diverse training data from each region and extensive local testing for safety and effectiveness.",
+                            difficulty: 5,
+                            topic: "AI Localization and Cultural Adaptation",
+                            type: "twisted",
+                            learningObjective: "Understand how AI systems must adapt to different cultural and regulatory contexts",
+                            hints: ["Consider how driving rules and behaviors vary between countries"],
+                            commonMistakes: ["Assuming a one-size-fits-all approach works for global AI deployment"],
+                            timeEstimate: "5 minutes"
+                        },
+                        {
+                            question: "A startup claims their AI can predict employee performance with 95% accuracy using resume data. As a consultant, what concerns would you raise?",
+                            options: ["Potential bias, privacy issues, over-reliance on historical data, and legal compliance concerns", "The accuracy is too low and should be 100%", "They should only focus on technical skills from resumes", "This is perfect and should be implemented immediately"],
+                            correctAnswer: "Potential bias, privacy issues, over-reliance on historical data, and legal compliance concerns",
+                            explanation: "HR AI systems raise serious concerns including perpetuating hiring biases, violating privacy regulations, reinforcing historical inequalities, and potential legal issues with discrimination. High accuracy doesn't guarantee fairness or ethical implementation.",
+                            difficulty: 5,
+                            topic: "AI in Human Resources - Ethics and Compliance",
+                            type: "twisted",
+                            learningObjective: "Critically evaluate AI applications for ethical and practical concerns",
+                            hints: ["Consider the potential negative impacts beyond just technical accuracy"],
+                            commonMistakes: ["Focusing only on accuracy metrics without considering fairness and legal implications"],
+                            timeEstimate: "5 minutes"
                         }
                     ]
                 }
@@ -1995,100 +3026,38 @@ app.get('/api/subscription-status', authenticateToken, async (req, res) => {
     }
 });
 
-app.use((error, req, res, next) => {
-    console.error('Error:', error);
+// Error handling middleware with testing integration
+app.use(backendTesting.errorTracker());
 
-    if (error.type === 'entity.parse.failed') {
-        return res.status(400).json({ error: 'Invalid JSON' });
-    }
-
-    if (error.name === 'ValidationError') {
-        return res.status(400).json({ error: 'Validation failed', details: error.message });
-    }
-
-    if (error.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ error: 'File too large' });
-    }
-
-    if (error.message && error.message.includes('Only PDF, TXT, DOC, and DOCX files are allowed')) {
-        return res.status(400).json({ error: 'Invalid file type' });
-    }
-
-    res.status(500).json({
-        error: 'Internal server error',
-        message: error.message
-    });
-});
-
-function validateEnvironmentVariables() {
-    const required = [
-        'MONGODB_URI',
-        'OPENAI_API_KEY',
-        'JWT_SECRET'
-    ];
-
-    const missing = required.filter(key => !process.env[key]);
-
-    if (missing.length > 0) {
-        console.error('❌ Missing required environment variables:');
-        missing.forEach(key => console.error(`   - ${key}`));
-        console.error('\n📋 See PRODUCTION_SETUP.md for configuration instructions');
-        return false;
-    }
-
-    console.log('✅ All required environment variables are configured');
-    return true;
-}
-
+// Initialize database before starting server
 async function startServer() {
     try {
-        if (!validateEnvironmentVariables()) {
-            console.error('⚠️  Server starting with missing environment variables - some features may not work');
-        }
-
-        // Start MongoDB Memory Server for Replit environment
-        console.log('🔄 Starting MongoDB Memory Server...');
-        const mongoUri = await startMongoDB();
-
-        // Update the MongoDB URI
-        process.env.MONGODB_URI = mongoUri;
-
-        await mongoClient.connect();
-        db = mongoClient.db('studymaster');
-        console.log('✅ Connected to MongoDB');
-
-        await db.collection('files').createIndex({ userId: 1 });
-        await db.collection('files').createIndex({ embedding: 1 });
-        await db.collection('flashcards').createIndex({ userId: 1, nextReview: 1 });
-        await db.collection('users').createIndex({ email: 1 }, { unique: true });
-
-        console.log('✅ Database indexes created');
-
-        if (process.env.STRIPE_SECRET_KEY) {
-            console.log('✅ Stripe integration ready');
-        }
-
-        if (process.env.OPENAI_API_KEY) {
-            console.log('✅ OpenAI API connection established');
-        }
-
-        app.listen(PORT, '0.0.0.0', () => {
+        console.log('🔄 Initializing database...');
+        await initializeDatabase();
+        console.log('✅ Database initialized successfully');
+        
+        // Start server with testing checklist integration
+        app.listen(PORT, '0.0.0.0', async () => {
             console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
             console.log(`📊 Health check: http://localhost:${PORT}/health`);
+            console.log(`🔍 Testing status: http://localhost:${PORT}/api/testing-status`);
             console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:8080'}`);
             console.log(`🌍 Replit URL: https://${process.env.REPLIT_DEV_DOMAIN || 'your-repl-name.username.replit.dev'}`);
+
+            // Run initial backend testing checklist
+            console.log('🔍 Running initial backend testing checklist...');
+            await backendTesting.runBackendChecklist(['logs', 'performance', 'security', 'database']);
+            console.log('✅ Backend testing checklist complete');
         });
     } catch (error) {
-        console.error('Failed to start server:', error);
+        console.error('❌ Failed to initialize database:', error);
         process.exit(1);
     }
 }
 
-module.exports = app;
+startServer();
 
-if (require.main === module) {
-    startServer();
-}
+module.exports = app;
 
 process.on('SIGINT', async () => {
     console.log('Shutting down gracefully...');
